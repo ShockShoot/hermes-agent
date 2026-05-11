@@ -1823,7 +1823,15 @@ class AIAgent:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
-        
+
+        # Expose session ID to tools (terminal, execute_code) so agents can
+        # reference their own session for --resume commands, cross-session
+        # coordination, and logging.  Overwritten each time a new AIAgent is
+        # constructed in the same process (gateway reuses the process for
+        # sequential turns on the same session, which is fine — the value
+        # stays the same until a new session starts).
+        os.environ["HERMES_SESSION_ID"] = self.session_id
+
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"
@@ -10078,6 +10086,7 @@ class AIAgent:
                 self._session_db.end_session(self.session_id, "compression")
                 old_session_id = self.session_id
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                os.environ["HERMES_SESSION_ID"] = self.session_id
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
                 self._session_db_created = False
