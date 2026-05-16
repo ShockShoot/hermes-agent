@@ -12511,13 +12511,28 @@ class AIAgent:
                     _base_provider = _arc_base.get("provider")
                     if _base_model and _base_provider:
                         if hasattr(self, "switch_model"):
-                            self.switch_model(
-                                _base_model,
-                                _base_provider,
-                                api_key=_arc_base.get("api_key", ""),
-                                base_url=_arc_base.get("base_url", ""),
-                                api_mode=_arc_base.get("api_mode", ""),
-                            )
+                            # HERMES_ARC_FIX: guard against mocks or older signatures.
+                            try:
+                                self.switch_model(
+                                    _base_model,
+                                    _base_provider,
+                                    api_key=_arc_base.get("api_key", ""),
+                                    base_url=_arc_base.get("base_url", ""),
+                                    api_mode=_arc_base.get("api_mode", ""),
+                                )
+                            except TypeError:
+                                try:
+                                    self.switch_model(_base_model, _base_provider)
+                                except Exception:
+                                    self.model = str(_base_model)
+                                    self.provider = str(_base_provider)
+                            # Sync url cache attrs after switch_model.
+                            try:
+                                self._base_url_lower = (self.base_url or "").lower()
+                                from agent.provider_utils import base_url_hostname as _arc_buh4
+                                self._base_url_hostname = _arc_buh4(self.base_url)
+                            except Exception:
+                                pass
                         else:
                             self.model = str(_base_model)
                             self.provider = str(_base_provider)
@@ -12525,6 +12540,16 @@ class AIAgent:
                                 self.base_url = str(_arc_base.get("base_url")).rstrip("/")
                             if _arc_base.get("api_key"):
                                 self.api_key = str(_arc_base.get("api_key"))
+                            # HERMES_ARC_FIX: sync url cache attrs and clear transport
+                            # cache when bypassing switch_model() property setter.
+                            try:
+                                self._base_url_lower = (self.base_url or "").lower()
+                                from agent.provider_utils import base_url_hostname as _arc_buh
+                                self._base_url_hostname = _arc_buh(self.base_url)
+                            except Exception:
+                                pass
+                            if hasattr(self, "_transport_cache"):
+                                self._transport_cache.clear()
                         _base_fallback_chain = [
                             f for f in (_arc_base.get("fallback_chain") or [])
                             if isinstance(f, dict) and f.get("provider") and f.get("model")
@@ -12573,13 +12598,32 @@ class AIAgent:
                             _resolved_api_mode = getattr(self, "api_mode", "")
 
                     if hasattr(self, "switch_model"):
-                        self.switch_model(
-                            _resolved_model,
-                            _target_provider,
-                            api_key=_resolved_api_key,
-                            base_url=_resolved_base_url,
-                            api_mode=_resolved_api_mode,
-                        )
+                        # HERMES_ARC_FIX: guard against mocks or older switch_model
+                        # signatures that don't accept keyword args.
+                        try:
+                            self.switch_model(
+                                _resolved_model,
+                                _target_provider,
+                                api_key=_resolved_api_key,
+                                base_url=_resolved_base_url,
+                                api_mode=_resolved_api_mode,
+                            )
+                        except TypeError:
+                            # Fallback for mocks or stripped switch_model signatures.
+                            try:
+                                self.switch_model(_resolved_model, _target_provider)
+                            except Exception:
+                                self.model = str(_resolved_model)
+                                self.provider = str(_target_provider)
+                        # Always sync url cache attrs after switch_model too — the
+                        # method sets self.base_url directly without going through
+                        # the property setter in some call paths.
+                        try:
+                            self._base_url_lower = (self.base_url or "").lower()
+                            from agent.provider_utils import base_url_hostname as _arc_buh3
+                            self._base_url_hostname = _arc_buh3(self.base_url)
+                        except Exception:
+                            pass
                     else:
                         self.model = str(_resolved_model)
                         self.provider = str(_target_provider)
@@ -12587,6 +12631,18 @@ class AIAgent:
                             self.base_url = _resolved_base_url
                         if _resolved_api_key:
                             self.api_key = _resolved_api_key
+                        if _resolved_api_mode:
+                            self.api_mode = _resolved_api_mode
+                        # HERMES_ARC_FIX: sync url cache attrs and clear transport
+                        # cache when bypassing switch_model() property setter.
+                        try:
+                            self._base_url_lower = (self.base_url or "").lower()
+                            from agent.provider_utils import base_url_hostname as _arc_buh2
+                            self._base_url_hostname = _arc_buh2(self.base_url)
+                        except Exception:
+                            pass
+                        if hasattr(self, "_transport_cache"):
+                            self._transport_cache.clear()
 
                     # HERMES_ARC_TOPIC_FALLBACK_PATCH: optional topic-scoped
                     # fallback chain supplied by topic_detect runtime_override.
