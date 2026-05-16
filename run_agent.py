@@ -12443,6 +12443,9 @@ class AIAgent:
         #
         # All injected context is ephemeral (not persisted to session DB).
         _plugin_user_context = ""
+        # HERMES_ARC_PATCH: runtime_override support
+        _runtime_override = {}
+        _plugin_system_prompt = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _pre_results = _invoke_hook(
@@ -12457,12 +12460,170 @@ class AIAgent:
             )
             _ctx_parts: list[str] = []
             for r in _pre_results:
-                if isinstance(r, dict) and r.get("context"):
-                    _ctx_parts.append(str(r["context"]))
+                if isinstance(r, dict):
+                    if r.get("context"):
+                        _ctx_parts.append(str(r["context"]))
+                    _arc_ov = r.get("runtime_override")
+                    if isinstance(_arc_ov, dict):
+                        _runtime_override.update(_arc_ov)
                 elif isinstance(r, str) and r.strip():
                     _ctx_parts.append(r)
             if _ctx_parts:
                 _plugin_user_context = "\n\n".join(_ctx_parts)
+
+            # HERMES_ARC_SKIPDETECT_PATCH: allow router plugins to rewrite the
+            # current turn user message after inspecting a command prefix.
+            _arc_user_message = _runtime_override.get("user_message")
+            if isinstance(_arc_user_message, str):
+                user_message = _arc_user_message
+                original_user_message = _arc_user_message
+                try:
+                    user_msg["content"] = _arc_user_message
+                    self._persist_user_message_override = _arc_user_message
+                except Exception:
+                    pass
+
+            # HERMES_ARC_PATCH: apply runtime routing overrides from plugins.
+            # Use Hermes' own switch_model() instead of mutating attributes
+            # directly — preserves provider-specific api_mode, OAuth, headers,
+            # context-compressor metadata, and client rebuild logic.
+            if isinstance(_runtime_override, dict) and _runtime_override:
+                _arc_restore_main = bool(_runtime_override.get("restore_main"))
+                _arc_model = _runtime_override.get("model")
+                _arc_provider = _runtime_override.get("provider")
+                _arc_base_url = _runtime_override.get("base_url")
+                _arc_api_key = _runtime_override.get("api_key")
+                _arc_api_mode = _runtime_override.get("api_mode")
+
+                if not hasattr(self, "_hermes_arc_base_runtime"):
+                    self._hermes_arc_base_runtime = {
+                        "model": getattr(self, "model", ""),
+                        "provider": getattr(self, "provider", ""),
+                        "base_url": getattr(self, "base_url", ""),
+                        "api_key": getattr(self, "api_key", ""),
+                        "api_mode": getattr(self, "api_mode", ""),
+                        "fallback_chain": list(getattr(self, "_fallback_chain", []) or []),
+                    }
+
+                if _arc_restore_main:
+                    _arc_base = getattr(self, "_hermes_arc_base_runtime", None) or {}
+                    _base_model = _arc_base.get("model")
+                    _base_provider = _arc_base.get("provider")
+                    if _base_model and _base_provider:
+                        if hasattr(self, "switch_model"):
+                            self.switch_model(
+                                _base_model,
+                                _base_provider,
+                                api_key=_arc_base.get("api_key", ""),
+                                base_url=_arc_base.get("base_url", ""),
+                                api_mode=_arc_base.get("api_mode", ""),
+                            )
+                        else:
+                            self.model = str(_base_model)
+                            self.provider = str(_base_provider)
+                            if _arc_base.get("base_url"):
+                                self.base_url = str(_arc_base.get("base_url")).rstrip("/")
+                            if _arc_base.get("api_key"):
+                                self.api_key = str(_arc_base.get("api_key"))
+                        _base_fallback_chain = [
+                            f for f in (_arc_base.get("fallback_chain") or [])
+                            if isinstance(f, dict) and f.get("provider") and f.get("model")
+                        ]
+                        self._fallback_chain = list(_base_fallback_chain)
+                        self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+                        self._fallback_index = 0
+                        self._fallback_activated = False
+                        logger.info(
+                            "hermes-arc: restored main runtime provider=%s model=%s fallbacks=%d",
+                            getattr(self, "provider", ""),
+                            getattr(self, "model", ""),
+                            len(self._fallback_chain),
+                        )
+                elif _arc_model or _arc_provider or _arc_base_url or _arc_api_key:
+                    _target_provider = str(_arc_provider or getattr(self, "provider", "") or "auto")
+                    _target_model = str(_arc_model or getattr(self, "model", ""))
+                    _resolved_model = _target_model
+                    _resolved_api_key = str(_arc_api_key or "")
+                    _resolved_base_url = str(_arc_base_url or "")
+                    _resolved_api_mode = str(_arc_api_mode or "")
+
+                    try:
+                        from agent.auxiliary_client import resolve_provider_client as _arc_resolve_provider_client
+                        _arc_client, _arc_client_model = _arc_resolve_provider_client(
+                            _target_provider,
+                            model=_target_model,
+                            raw_codex=True,
+                            explicit_base_url=_resolved_base_url or None,
+                            explicit_api_key=_resolved_api_key or None,
+                            api_mode=_resolved_api_mode or None,
+                            main_runtime=getattr(self, "_primary_runtime", None),
+                        )
+                        if _arc_client is not None:
+                            _resolved_model = str(_arc_client_model or _target_model)
+                            _resolved_api_key = str(getattr(_arc_client, "api_key", "") or _resolved_api_key)
+                            _resolved_base_url = str(getattr(_arc_client, "base_url", "") or _resolved_base_url).rstrip("/")
+                    except Exception as _arc_resolve_error:
+                        logger.debug("hermes-arc: provider resolution skipped: %s", _arc_resolve_error)
+
+                    if not _resolved_api_mode:
+                        try:
+                            from hermes_cli.providers import determine_api_mode as _arc_determine_api_mode
+                            _resolved_api_mode = _arc_determine_api_mode(_target_provider, _resolved_base_url)
+                        except Exception:
+                            _resolved_api_mode = getattr(self, "api_mode", "")
+
+                    if hasattr(self, "switch_model"):
+                        self.switch_model(
+                            _resolved_model,
+                            _target_provider,
+                            api_key=_resolved_api_key,
+                            base_url=_resolved_base_url,
+                            api_mode=_resolved_api_mode,
+                        )
+                    else:
+                        self.model = str(_resolved_model)
+                        self.provider = str(_target_provider)
+                        if _resolved_base_url:
+                            self.base_url = _resolved_base_url
+                        if _resolved_api_key:
+                            self.api_key = _resolved_api_key
+
+                    # HERMES_ARC_TOPIC_FALLBACK_PATCH: optional topic-scoped
+                    # fallback chain supplied by topic_detect runtime_override.
+                    _arc_fb_chain_raw = _runtime_override.get("fallback_chain")
+                    if isinstance(_arc_fb_chain_raw, list):
+                        _arc_topic_fb_chain = [
+                            f for f in _arc_fb_chain_raw
+                            if isinstance(f, dict) and f.get("provider") and f.get("model")
+                        ]
+                        _arc_base = getattr(self, "_hermes_arc_base_runtime", None) or {}
+                        _arc_global_fb_chain = [
+                            f for f in (_arc_base.get("fallback_chain") or [])
+                            if isinstance(f, dict) and f.get("provider") and f.get("model")
+                        ]
+                        self._fallback_chain = list(_arc_topic_fb_chain) + list(_arc_global_fb_chain)
+                        self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+                        self._fallback_index = 0
+                        self._fallback_activated = False
+                        logger.info(
+                            "hermes-arc: topic fallback chain loaded topic_entries=%d global_entries=%d total=%d",
+                            len(_arc_topic_fb_chain),
+                            len(_arc_global_fb_chain),
+                            len(self._fallback_chain),
+                        )
+
+                    logger.info(
+                        "hermes-arc: runtime_override applied provider=%s model=%s api_mode=%s",
+                        getattr(self, "provider", ""),
+                        getattr(self, "model", ""),
+                        getattr(self, "api_mode", ""),
+                    )
+
+                # HERMES_ARC_SYSTEM_PROMPT_PATCH: capture system prompt override
+                _arc_sys = _runtime_override.get("system_prompt")
+                if _arc_sys:
+                    _plugin_system_prompt = str(_arc_sys)
+                    _ctx_parts.append(_plugin_system_prompt)
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -15878,11 +16039,13 @@ class AIAgent:
         if final_response and not interrupted:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
+                # HERMES_ARC_TRANSFORM_PROVIDER_PATCH: add provider for signature rebuild
                 _transform_results = _invoke_hook(
                     "transform_llm_output",
                     response_text=final_response,
                     session_id=self.session_id or "",
                     model=self.model,
+                    provider=self.provider,
                     platform=getattr(self, "platform", None) or "",
                 )
                 for _hook_result in _transform_results:
@@ -15891,6 +16054,44 @@ class AIAgent:
                         break  # First non-empty string wins
             except Exception as exc:
                 logger.warning("transform_llm_output hook failed: %s", exc)
+
+        # HERMES_ARC_RESPONSE_SUFFIX_PATCH: render ARC signature from
+        # _runtime_override (structured _arc_signature dict) and the final
+        # model/provider after any fallback occurred.
+        if final_response and not interrupted:
+            try:
+                _arc_sig = (_runtime_override or {}).get("_arc_signature")
+                if isinstance(_arc_sig, dict):
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _arc_inv
+                        _arc_final_sig_results = _arc_inv(
+                            "transform_llm_output",
+                            response_text="",
+                            session_id=self.session_id or "",
+                            model=self.model,
+                            provider=self.provider,
+                            platform=getattr(self, "platform", None) or "",
+                            _arc_finalize=_arc_sig,
+                        )
+                        for _arc_hr in _arc_final_sig_results:
+                            if isinstance(_arc_hr, str) and _arc_hr:
+                                final_response = final_response.rstrip() + "\n\n" + _arc_hr
+                                break
+                    except Exception:
+                        _routed = _arc_sig.get("routed_model", "")
+                        _routed_p = _arc_sig.get("routed_provider", "")
+                        _final_m = self.model or ""
+                        _final_p = self.provider or ""
+                        _topic = _arc_sig.get("topic", "")
+                        _short = lambda m: m.split("/")[-1] if "/" in m else m
+                        if _short(_final_m) == _short(_routed) and _final_p == _routed_p:
+                            _arc_suffix = f"- {_short(_final_m)} [{_topic}]"
+                        else:
+                            _arc_suffix = f"- {_short(_final_m)} [{_topic} | routed: {_short(_routed)}]"
+                        if _arc_suffix:
+                            final_response = final_response.rstrip() + "\n\n" + _arc_suffix
+            except Exception:
+                logger.debug("hermes-arc: response suffix render failed")
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
